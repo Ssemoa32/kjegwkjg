@@ -70,10 +70,10 @@ jobs:
       - name: Connect to Tailscale
         shell: powershell
         env:
-          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
           $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
-          & $ts up --authkey=$env:TAILSCALE_AUTHKEY `
+          & $ts up --authkey=$env:TAILSCALE_AUTH_KEY `
                    --hostname="gh-rdp-$env:GITHUB_RUN_ID" `
                    --accept-routes
           $tsIP = $null
