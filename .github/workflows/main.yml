@@ -3,7 +3,7 @@ name: RDP
 on:
   workflow_dispatch:
   schedule:
-    - cron: '*/12 * * * *'
+    - cron: '8 */6 * * *'
 
 jobs:
   secure-rdp:
@@ -11,9 +11,6 @@ jobs:
     timeout-minutes: 360
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
       - name: Configure Core RDP Settings
         shell: powershell
         run: |
@@ -32,40 +29,36 @@ jobs:
       - name: Create RDP User with Secure Password
         shell: powershell
         run: |
-          $charSet = @{
-            Upper   = 65..90  | ForEach-Object { [char]$_ }
-            Lower   = 97..122 | ForEach-Object { [char]$_ }
-            Number  = 48..57  | ForEach-Object { [char]$_ }
-            Special = @('!','@','#','$','%','^','&','*')
-          }
-          $rawPassword = @()
-          $rawPassword += $charSet.Upper   | Get-Random -Count 3
-          $rawPassword += $charSet.Lower   | Get-Random -Count 3
-          $rawPassword += $charSet.Number  | Get-Random -Count 3
-          $rawPassword += $charSet.Special | Get-Random -Count 2
-          $password = -join ($rawPassword | Sort-Object { Get-Random })
+          $upper   = 65..90  | ForEach-Object { [char]$_ }
+          $lower   = 97..122 | ForEach-Object { [char]$_ }
+          $numbers = 48..57  | ForEach-Object { [char]$_ }
+          $special = @('!','@','#','$','%','^','&','*')
+          $raw = @()
+          $raw += $upper   | Get-Random -Count 3
+          $raw += $lower   | Get-Random -Count 3
+          $raw += $numbers | Get-Random -Count 3
+          $raw += $special | Get-Random -Count 2
+          $password = -join ($raw | Sort-Object { Get-Random })
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
           if (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue) {
             Set-LocalUser -Name "RDP" -Password $securePass
-            Write-Host "User RDP password updated."
           } else {
-            New-LocalUser -Name "RDP" -Password $securePass `
-              -FullName "RDP User" -AccountNeverExpires
-            Write-Host "User RDP created."
+            New-LocalUser -Name "RDP" -Password $securePass -FullName "RDP User" -AccountNeverExpires
           }
           Add-LocalGroupMember -Group "Administrators"       -Member "RDP" -ErrorAction SilentlyContinue
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP" -ErrorAction SilentlyContinue
           echo "RDP_PASS=$password" >> $env:GITHUB_ENV
+          Write-Host "User RDP ready."
 
       - name: Install Tailscale
         shell: powershell
         run: |
-          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
           $installer = "$env:TEMP\tailscale.msi"
-          Invoke-WebRequest -Uri $tsUrl -OutFile $installer -UseBasicParsing
+          Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" `
+                            -OutFile $installer -UseBasicParsing
           Start-Process msiexec.exe -ArgumentList "/i `"$installer`" /quiet /norestart" -Wait
           Remove-Item $installer -Force
-          Write-Host "Tailscale installed successfully."
+          Write-Host "Tailscale installed."
 
       - name: Connect to Tailscale
         shell: powershell
@@ -92,15 +85,13 @@ jobs:
         run: |
           $result = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
           if (-not $result.TcpTestSucceeded) {
-            Write-Error "RDP port 3389 is not reachable!"
-            exit 1
+            Write-Error "RDP port 3389 not reachable!"; exit 1
           }
-          Write-Host "RDP port 3389 is OPEN and ready."
+          Write-Host "RDP port 3389 is OPEN."
 
-      - name: Show Connection Info and Keep Session Alive
+      - name: Show Connection Info and Keep Alive
         shell: powershell
         run: |
-          Write-Host ""
           Write-Host "=========================================="
           Write-Host "   RDP CONNECTION INFO"
           Write-Host "=========================================="
@@ -114,6 +105,6 @@ jobs:
           $info | Out-File -FilePath "C:\rdp_info.txt" -Encoding UTF8
           $end = (Get-Date).AddMinutes(355)
           while ((Get-Date) -lt $end) {
-            Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Session active - $env:TAILSCALE_IP"
+            Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Active - $env:TAILSCALE_IP"
             Start-Sleep -Seconds 60
           }
