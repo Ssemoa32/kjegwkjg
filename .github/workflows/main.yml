@@ -3,135 +3,117 @@ name: RDP
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 */5 * * *'
+    - cron: '*/12 * * * *'
 
 jobs:
   secure-rdp:
     runs-on: windows-latest
-    timeout-minutes: 3600
+    timeout-minutes: 360
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Configure Core RDP Settings
+        shell: powershell
         run: |
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-                             -Name "fDenyTSConnections" -Value 0 -Force
+                           -Name "fDenyTSConnections" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                             -Name "UserAuthentication" -Value 0 -Force
+                           -Name "UserAuthentication" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                             -Name "SecurityLayer" -Value 0 -Force
-          netsh advfirewall firewall delete rule name="RDP-Tailscale"
+                           -Name "SecurityLayer" -Value 0 -Force
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" 2>$null
           netsh advfirewall firewall add rule name="RDP-Tailscale" `
             dir=in action=allow protocol=TCP localport=3389
           Restart-Service -Name TermService -Force
+          Write-Host "RDP configured successfully."
 
       - name: Create RDP User with Secure Password
+        shell: powershell
         run: |
-          Add-Type -AssemblyName System.Security
           $charSet = @{
             Upper   = 65..90  | ForEach-Object { [char]$_ }
             Lower   = 97..122 | ForEach-Object { [char]$_ }
             Number  = 48..57  | ForEach-Object { [char]$_ }
-            Special = '!','@','#','$','%','^','&','*','(',')'
+            Special = @('!','@','#','$','%','^','&','*')
           }
           $rawPassword = @()
-          $rawPassword += $charSet.Upper   | Get-Random -Count 4
-          $rawPassword += $charSet.Lower   | Get-Random -Count 4
-          $rawPassword += $charSet.Number  | Get-Random -Count 4
-          $rawPassword += $charSet.Special | Get-Random -Count 4
+          $rawPassword += $charSet.Upper   | Get-Random -Count 3
+          $rawPassword += $charSet.Lower   | Get-Random -Count 3
+          $rawPassword += $charSet.Number  | Get-Random -Count 3
+          $rawPassword += $charSet.Special | Get-Random -Count 2
           $password = -join ($rawPassword | Sort-Object { Get-Random })
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
           if (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue) {
             Set-LocalUser -Name "RDP" -Password $securePass
+            Write-Host "User RDP password updated."
           } else {
-            New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires
+            New-LocalUser -Name "RDP" -Password $securePass `
+              -FullName "RDP User" -AccountNeverExpires
+            Write-Host "User RDP created."
           }
-          Add-LocalGroupMember -Group "Administrators" -Member "RDP" -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Administrators"       -Member "RDP" -ErrorAction SilentlyContinue
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP" -ErrorAction SilentlyContinue
           echo "RDP_PASS=$password" >> $env:GITHUB_ENV
 
       - name: Install Tailscale
+        shell: powershell
         run: |
-          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
-          $installerPath = "$env:TEMP\tailscale.msi"
-          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
-          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
-          Remove-Item $installerPath -Force
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
+          $installer = "$env:TEMP\tailscale.msi"
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installer -UseBasicParsing
+          Start-Process msiexec.exe -ArgumentList "/i `"$installer`" /quiet /norestart" -Wait
+          Remove-Item $installer -Force
+          Write-Host "Tailscale installed successfully."
 
-      - name: Establish Tailscale Connection
+      - name: Connect to Tailscale
+        shell: powershell
         env:
           TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
         run: |
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=$env:TAILSCALE_AUTHKEY --hostname=gh-runner-$env:GITHUB_RUN_ID
+          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          & $ts up --authkey=$env:TAILSCALE_AUTHKEY `
+                   --hostname="gh-rdp-$env:GITHUB_RUN_ID" `
+                   --accept-routes
           $tsIP = $null
-          $retries = 0
-          while (-not $tsIP -and $retries -lt 10) {
-            $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
-            Start-Sleep -Seconds 5
-            $retries++
+          $tries = 0
+          while (-not $tsIP -and $tries -lt 15) {
+            Start-Sleep -Seconds 4
+            $tsIP = (& $ts ip -4 2>$null)
+            $tries++
           }
-          if (-not $tsIP) { Write-Error "Tailscale IP not assigned."; exit 1 }
+          if (-not $tsIP) { Write-Error "Failed to get Tailscale IP."; exit 1 }
           echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+          Write-Host "Tailscale IP: $tsIP"
 
-      - name: Auto-Start Bot on Session Begin
+      - name: Verify RDP Port
+        shell: powershell
         run: |
-          $startupScript = @"
-          # ===== سكربت تشغيل البوت التلقائي =====
-          # عدّل هذا القسم بمسار البوت الخاص بك
-          # مثال: python C:\bot\bot.py
-          # مثال: node C:\bot\index.js
-
-          # تشغيل البوت تلقائياً عند بدء الجلسة
-          # Start-Process python -ArgumentList "C:\bot\bot.py" -WindowStyle Hidden
-
-          Write-Host "[$(Get-Date)] Bot startup script executed."
-          "@
-          $startupScript | Out-File -FilePath "C:\startup_bot.ps1" -Encoding UTF8
-
-          # تسجيل المهمة في Task Scheduler لتشغيل البوت عند بدء الجلسة
-          $action  = New-ScheduledTaskAction -Execute "powershell.exe" `
-                       -Argument "-ExecutionPolicy Bypass -File C:\startup_bot.ps1"
-          $trigger = New-ScheduledTaskTrigger -AtLogOn
-          $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
-          Register-ScheduledTask -TaskName "BotAutoStart" `
-            -Action $action -Trigger $trigger -Settings $settings `
-            -RunLevel Highest -Force
-          Write-Host "[$(Get-Date)] Task Scheduler configured successfully."
-
-      - name: Verify RDP Accessibility
-        run: |
-          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
-          if (-not $testResult.TcpTestSucceeded) {
-            Write-Error "TCP connection to RDP port 3389 failed"
+          $result = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          if (-not $result.TcpTestSucceeded) {
+            Write-Error "RDP port 3389 is not reachable!"
             exit 1
           }
-          Write-Host "TCP connectivity successful!"
+          Write-Host "RDP port 3389 is OPEN and ready."
 
-      - name: Show Connection Info & Keep Alive
+      - name: Show Connection Info and Keep Session Alive
+        shell: powershell
         run: |
-          Write-Host "`n========== RDP ACCESS INFO =========="
-          Write-Host "Address  : $env:TAILSCALE_IP"
-          Write-Host "Username : RDP"
-          Write-Host "Password : $env:RDP_PASS"
-          Write-Host "Port     : 3389"
-          Write-Host "====================================`n"
-          Write-Host "Bot startup script : C:\startup_bot.ps1"
-          Write-Host "Task Scheduler     : BotAutoStart (runs at logon)"
-          Write-Host "====================================`n"
-
-          # حفظ معلومات الاتصال في ملف للرجوع إليها
-          $info = @"
-          IP=$env:TAILSCALE_IP
-          USERNAME=RDP
-          PASSWORD=$env:RDP_PASS
-          DATE=$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
-          "@
+          Write-Host ""
+          Write-Host "=========================================="
+          Write-Host "   RDP CONNECTION INFO"
+          Write-Host "=========================================="
+          Write-Host "  IP Address : $env:TAILSCALE_IP"
+          Write-Host "  Username   : RDP"
+          Write-Host "  Password   : $env:RDP_PASS"
+          Write-Host "  Port       : 3389"
+          Write-Host "  Session    : 6 Hours Max"
+          Write-Host "=========================================="
+          $info = "IP=$env:TAILSCALE_IP`nUSERNAME=RDP`nPASSWORD=$env:RDP_PASS`nDATE=$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
           $info | Out-File -FilePath "C:\rdp_info.txt" -Encoding UTF8
-
-          # الإبقاء على الجلسة نشطة
-          while ($true) {
-            Write-Host "[$(Get-Date)] RDP Active - Session running..."
-            Start-Sleep -Seconds 300
+          $end = (Get-Date).AddMinutes(355)
+          while ((Get-Date) -lt $end) {
+            Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Session active - $env:TAILSCALE_IP"
+            Start-Sleep -Seconds 60
           }
